@@ -6,8 +6,15 @@
 
 import test from "node:test"
 import assert from "node:assert/strict"
+import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 import { OfficeAceAuthPlugin, _internal as x } from "./index.mjs"
+
+// An override pointing at a directory with no routing state, so tests do not
+// read the developer machine's real ~/.office-claw routing credentials.
+const NO_ROUTING_ENV = { OFFICEACE_ROUTING_DIR: join(tmpdir(), "officeace-no-routing") }
 
 const buf = (s) => new TextEncoder().encode(s)
 
@@ -382,7 +389,7 @@ test("loader signs a non-MaaS chat request with SDK-HMAC-SHA256", async () => {
     if (u.includes("/chat/completions")) return new Response(JSON.stringify({ choices: [] }), { status: 200 })
     return new Response("", { status: 404 })
   }
-  const plugin = await OfficeAceAuthPlugin({ client: {} }, { fetch: fetcher })
+  const plugin = await OfficeAceAuthPlugin({ client: {} }, { fetch: fetcher, env: NO_ROUTING_ENV })
   const loaded = await plugin.auth.loader(async () => makeAuth(cred))
 
   // deepseek-v3.1 has no model_auth_info → signed fallback.
@@ -422,6 +429,100 @@ test("loader resolves the per-model MaaS auth when the body is a Request", async
   const chatCall = seen.find((s) => s.url.includes("/chat/completions"))
   assert.equal(chatCall.url, "https://maas.example.com/v2/chat/completions")
   assert.match(new Headers(chatCall.init.headers).get("authorization"), /^Basic /)
+})
+
+// ---- account-level MaaS auth (client-permission-validate) -------------------
+
+const permissionBody = JSON.stringify({
+  code: 0,
+  model_info: {
+    model_api_url_base: "https://maas-acct.example.com/",
+    model_auth_info: { model_app_key: "AK_APP", model_app_secret: "SK_APP" },
+  },
+})
+
+// A studio list whose items carry NO model_auth_info, as the live API returns.
+const bareStudioBody = JSON.stringify({
+  data: [{ model_name: "glm-5.2", service_name: "GLM-5.2", api_url: "https://maas.example.com" }],
+  total: 1,
+})
+
+test("fetchModelInfo signs a GET to the permission endpoint and returns model_info", async () => {
+  const seen = []
+  const fetcher = async (url, init) => {
+    seen.push({ url: String(url), init })
+    if (String(url).includes("/v1/claw/client-permission-validate")) {
+      return new Response(permissionBody, { status: 200 })
+    }
+    return new Response("", { status: 404 })
+  }
+  const info = await x.fetchModelInfo(
+    { access_key_id: "AK", secret_access_key: "SK", security_token: "ST", project_id: "P" },
+    fetcher,
+    {},
+  )
+  assert.equal(info.model_api_url_base, "https://maas-acct.example.com/")
+  const h = new Headers(seen[0].init.headers)
+  assert.match(h.get("authorization"), /^SDK-HMAC-SHA256 Access=AK,/)
+  assert.equal(h.get("x-subscription-type"), "v2")
+  assert.ok(h.get("x-security-token"))
+  assert.ok(h.get("x-project-id"))
+})
+
+test("modelInfoChatConfig normalizes the base URL and builds Basic auth", () => {
+  const cfg = x.modelInfoChatConfig({
+    model_api_url_base: "https://maas-acct.example.com/",
+    model_auth_info: { model_app_key: "K", model_app_secret: "S" },
+  })
+  assert.equal(cfg.baseUrl, "https://maas-acct.example.com/v2")
+  assert.equal(cfg.authorization, `Basic ${Buffer.from("K:S").toString("base64")}`)
+  assert.equal(x.modelInfoChatConfig({}), null)
+})
+
+test("extractModelInfo reads model_info from the payload or its subscription", () => {
+  assert.equal(x.extractModelInfo({ model_info: { a: 1 } }).a, 1)
+  assert.equal(x.extractModelInfo({ data: { model_info: { a: 1 } } }).a, 1)
+  assert.equal(x.extractModelInfo({ data: { subscription: { model_info: { b: 2 } } } }).b, 2)
+  assert.equal(x.extractModelInfo({}), null)
+})
+
+test("loader falls back to the account model_info when the studio list carries no auth", async () => {
+  const cred = await makeCred()
+  const seen = []
+  const fetcher = async (url, init) => {
+    const u = String(url)
+    seen.push({ url: u, init })
+    if (u.includes("/v1/studio/model-services")) return new Response(bareStudioBody, { status: 200 })
+    if (u.includes("/v1/claw/client-permission-validate")) return new Response(permissionBody, { status: 200 })
+    if (u.includes("/chat/completions")) return new Response(JSON.stringify({ choices: [] }), { status: 200 })
+    return new Response("", { status: 404 })
+  }
+  const plugin = await OfficeAceAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+
+  await loaded.fetch("https://agentarts.example.com/v2/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "glm-5.2", messages: [] }),
+  })
+
+  const chatCall = seen.find((s) => s.url.includes("/chat/completions"))
+  assert.ok(chatCall, "a chat request was made")
+  assert.equal(chatCall.url, "https://maas-acct.example.com/v2/chat/completions")
+  assert.match(new Headers(chatCall.init.headers).get("authorization"), /^Basic /)
+})
+
+test("provider.models applies the account model_info base URL", async () => {
+  const cred = await makeCred()
+  const fetcher = async (url) => {
+    const u = String(url)
+    if (u.includes("/v1/studio/model-services")) return new Response(bareStudioBody, { status: 200 })
+    if (u.includes("/v1/claw/client-permission-validate")) return new Response(permissionBody, { status: 200 })
+    return new Response("", { status: 404 })
+  }
+  const plugin = await OfficeAceAuthPlugin({ client: {} }, { fetch: fetcher })
+  const models = await plugin.provider.models({ models: { "glm-5.2": {} } }, { auth: makeAuth(cred) })
+  assert.equal(models["glm-5.2"].api, "https://maas-acct.example.com/v2")
 })
 
 test("loader returns nothing when not signed in", async () => {
@@ -545,4 +646,91 @@ test("auth.methods[0].authorize returns a url and a callback that resolves succe
   const cred = JSON.parse(result.access)
   assert.equal(cred.access_key_id, "AK")
   assert.equal(result.refresh, "R")
+})
+
+// ---- local desktop routing ------------------------------------------------
+
+async function withRoutingFixture(run) {
+  const dir = await mkdtemp(join(tmpdir(), "officeace-routing-"))
+  try {
+    const userDir = join(dir, "routing_state", "users", "u1")
+    await mkdir(userDir, { recursive: true })
+    await writeFile(join(userDir, "models.json"), JSON.stringify({
+      defaults: [
+        {
+          model_client_config: {
+            model_name: "glm-5.2",
+            api_base: "https://modelgw-0004.officeace.cn-southwest-2.huaweicloud-agentarts.com",
+            api_key: "huawei-maas-session",
+            custom_headers: { Authorization: "Basic MTIzNDU2Nzg5MGFiY2RlZg==" },
+          },
+        },
+        {
+          model_client_config: {
+            model_name: "deepseek-v4.1-flash",
+            api_base: "https://modelgw-0004.officeace.cn-southwest-2.huaweicloud-agentarts.com",
+            custom_headers: { Authorization: "Basic MTIzNDU2Nzg5MGFiY2RlZg==" },
+          },
+        },
+      ],
+    }))
+    const env = {
+      OFFICEACE_ROUTING_DIR: dir,
+      HUAWEI_CLAW_URL: "https://agentarts.example.com",
+    }
+    return await run(env, dir)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+}
+
+test("localChatConfig reads the desktop app's per-user routing state", async () => {
+  await withRoutingFixture(async (env, dir) => {
+    const hit = await x.localChatConfig("glm-5.2", env)
+    assert.ok(hit, "a chat config was resolved")
+    assert.equal(hit.baseUrl, "https://modelgw-0004.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2")
+    assert.match(hit.authorization, /^Basic /)
+
+    // An unlisted model falls back to the account-wide default entry.
+    const fallback = await x.localChatConfig("no-such-model", env)
+    assert.equal(fallback.baseUrl, hit.baseUrl)
+
+    // An override pointing at a directory without routing state resolves to null.
+    assert.equal(await x.localChatConfig("glm-5.2", { OFFICEACE_ROUTING_DIR: join(dir, "missing") }), null)
+  })
+})
+
+test("loader routes chat to the local model gateway when the account has no model_info", async () => {
+  await withRoutingFixture(async (env) => {
+    const seen = []
+    const fetcher = async (url, init) => {
+      const u = String(url)
+      seen.push({ url: u, init })
+      if (u.includes("/v3.0/OS-CREDENTIAL/securitytokens")) return new Response("{}", { status: 404 })
+      // No studio list and no subscription model_info for this account.
+      if (u.includes("/v1/claw/client-permission-validate")) {
+        return new Response(JSON.stringify({ account_id: "a", principal_urn: "p", principal_id: "i", subscription: null }), { status: 200 })
+      }
+      if (u.includes("/v1/studio/model-services")) return new Response(JSON.stringify({ data: [], total: 0 }), { status: 200 })
+      if (u.includes("/chat/completions")) return new Response(JSON.stringify({ choices: [] }), { status: 200 })
+      return new Response("", { status: 404 })
+    }
+    const plugin = await OfficeAceAuthPlugin({ client: {} }, { fetch: fetcher, env })
+    const cred = await makeCred()
+    const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+
+    await loaded.fetch("https://agentarts.example.com/v2/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "glm-5.2", messages: [] }),
+    })
+
+    const chatCall = seen.find((s) => s.url.includes("/chat/completions"))
+    assert.ok(chatCall, "a chat request was made")
+    assert.equal(
+      chatCall.url,
+      "https://modelgw-0004.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2/chat/completions",
+    )
+    assert.equal(new Headers(chatCall.init.headers).get("authorization"), "Basic MTIzNDU2Nzg5MGFiY2RlZg==")
+  })
 })

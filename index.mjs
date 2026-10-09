@@ -1,4 +1,8 @@
 // AI生成
+import { readFile, readdir } from "node:fs/promises"
+import { homedir } from "node:os"
+import { join } from "node:path"
+
 // OfficeAce (华为云果办 / OfficeClaw) as a magpie / OpenCode provider plugin.
 //
 // OfficeAce, Huawei Cloud's office-productivity agent (果办), serves its models
@@ -808,6 +812,171 @@ function resolveModelChatConfig(model) {
   return { baseUrl: normalizeMaasBaseUrl(rawBase), authorization: auth }
 }
 
+/** Strict "is a JSON object" test (unlike asRecord, never coerces). */
+const isPlainRecord = (v) => typeof v === "object" && v !== null && !Array.isArray(v)
+
+/**
+ * Pull the MaaS `model_info` out of a /v1/claw/client-permission-validate
+ * payload. The desktop client sources its chat credentials from this endpoint;
+ * the per-model studio list does not always carry `model_auth_info`.
+ */
+function extractModelInfo(payload) {
+  const root = isPlainRecord(payload) ? payload : null
+  if (!root) return null
+  const data = isPlainRecord(root.data) ? root.data : root
+  if (isPlainRecord(data.model_info)) return data.model_info
+  const sub = isPlainRecord(data.subscription) ? data.subscription : null
+  const subData = sub && isPlainRecord(sub.data) ? sub.data : sub
+  if (isPlainRecord(subData?.model_info)) return subData.model_info
+  return null
+}
+
+/**
+ * Resolve the account-level chat config (baseUrl + Authorization) from a MaaS
+ * `model_info`. Accepts both the nested `model_auth_info` shape and a flat one.
+ */
+function modelInfoChatConfig(modelInfo) {
+  if (!isPlainRecord(modelInfo)) return null
+  const authInfo = isPlainRecord(modelInfo.model_auth_info) ? modelInfo.model_auth_info : modelInfo
+  const authorization = buildMaasAuthorization(authInfo)
+  if (!authorization) return null
+  const rawBase = firstOf(
+    modelInfo.model_api_url_base,
+    modelInfo.apiBaseUrl,
+    modelInfo.baseUrl,
+  )
+  if (!rawBase) return null
+  return { baseUrl: normalizeMaasBaseUrl(rawBase), authorization }
+}
+
+/**
+ * Signed GET to /v1/claw/client-permission-validate → MaaS `model_info`.
+ * Mirrors the desktop client, where `x-subscription-type: v2` is part of the
+ * signed header set.
+ */
+async function fetchModelInfo(cred, fetcher, env) {
+  if (!cred?.access_key_id || !cred?.secret_access_key) return null
+  const url = permissionValidateUrl(env)
+  const signed = await buildSignedHeaders({
+    method: "GET",
+    url,
+    credential: {
+      accessKey: cred.access_key_id,
+      secretKey: cred.secret_access_key,
+      securityToken: cred.security_token,
+      projectId: cred.project_id || "",
+    },
+    bodyText: "",
+    headers: { "x-subscription-type": "v2" },
+    algorithm: ALGO_SDK,
+  })
+  if (!signed) return null
+  try {
+    const res = await fetcher(url, { method: "GET", headers: signed })
+    if (!res.ok) return null
+    return extractModelInfo(await res.json().catch(() => null))
+  } catch {
+    return null
+  }
+}
+
+// ---- local desktop routing (the app's own model-gateway credentials) --------
+
+// The desktop app provisions a per-user model-gateway credential on disk
+// (~/.office-claw/.jiuwenclaw/config/routing_state/users/<uid>/models.json, and
+// ~/.office-claw/users/<uid>/model.json). That state is the authoritative chat
+// base URL + `Authorization` for the signed-in account; when this OAuth account
+// carries no MaaS `model_info`, reuse it rather than guessing an endpoint.
+const LOCAL_ROUTING_TTL_MS = 5 * 60 * 1000
+const localRoutingCache = new Map()
+
+function localRoutingDirs(env) {
+  const override = typeof env?.OFFICEACE_ROUTING_DIR === "string" ? env.OFFICEACE_ROUTING_DIR.trim() : ""
+  if (override) return [join(override, "routing_state", "users"), join(override, "users")]
+  const home = typeof homedir === "function" ? homedir() : ""
+  if (!home) return []
+  const root = join(home, ".office-claw")
+  return [join(root, ".jiuwenclaw", "config", "routing_state", "users"), join(root, "users")]
+}
+
+/** Read the desktop app's per-user model routing (base URL + Basic auth). */
+async function readLocalChatConfigs(env) {
+  const byModel = new Map()
+  let defaultBase = ""
+  let defaultAuth = ""
+  for (const dir of localRoutingDirs(env)) {
+    let uids = []
+    try {
+      uids = await readdir(dir)
+    } catch {
+      continue
+    }
+    for (const uid of uids) {
+      try {
+        const parsed = JSON.parse(await readFile(join(dir, uid, "models.json"), "utf8"))
+        for (const entry of Array.isArray(parsed?.defaults) ? parsed.defaults : []) {
+          const mc = entry?.model_client_config ?? {}
+          const name = typeof mc.model_name === "string" ? mc.model_name.trim() : ""
+          const base = normalizeMaasBaseUrl(mc.api_base)
+          const auth = typeof mc.custom_headers?.Authorization === "string" ? mc.custom_headers.Authorization.trim() : ""
+          if (!name || !base) continue
+          if (!defaultBase) defaultBase = base
+          if (!defaultAuth && auth) defaultAuth = auth
+          const key = name.toLowerCase()
+          const seen = byModel.get(key)
+          if (!seen) byModel.set(key, { baseUrl: base, authorization: auth })
+          else if (!seen.authorization && auth) seen.authorization = auth
+        }
+      } catch {
+        /* try the next shape */
+      }
+      try {
+        const parsed = JSON.parse(await readFile(join(dir, uid, "model.json"), "utf8"))
+        const list = parsed?.["huawei-maas"]
+        for (const item of Array.isArray(list) ? list : []) {
+          const name = typeof item?.id === "string" ? item.id.trim() : ""
+          const base = normalizeMaasBaseUrl(item?.baseUrl)
+          if (!name || !base) continue
+          if (!defaultBase) defaultBase = base
+          const key = name.toLowerCase()
+          if (!byModel.has(key)) byModel.set(key, { baseUrl: base, authorization: "" })
+        }
+      } catch {
+        /* optional file */
+      }
+    }
+  }
+  return { byModel, defaultBase, defaultAuth }
+}
+
+/**
+ * Chat config for a model from the desktop app's local routing state. Falls back
+ * to the account-wide entry when the model is not listed. Returns null when the
+ * state is absent (so callers keep the previous behaviour).
+ */
+async function localChatConfig(modelId, env, now = Date.now()) {
+  const cacheKey = typeof env?.OFFICEACE_ROUTING_DIR === "string" ? env.OFFICEACE_ROUTING_DIR.trim() : ""
+  let snapshot = null
+  const cached = localRoutingCache.get(cacheKey)
+  if (cached && now - cached.at <= LOCAL_ROUTING_TTL_MS) {
+    snapshot = cached.value
+  } else {
+    try {
+      snapshot = await readLocalChatConfigs(env)
+    } catch {
+      snapshot = null
+    }
+    localRoutingCache.set(cacheKey, { at: now, value: snapshot })
+  }
+  if (!snapshot) return null
+  const key = typeof modelId === "string" ? modelId.trim().toLowerCase() : ""
+  const hit = key ? snapshot.byModel.get(key) : undefined
+  const baseUrl = hit?.baseUrl || snapshot.defaultBase
+  const authorization = hit?.authorization || snapshot.defaultAuth
+  if (!baseUrl || !authorization) return null
+  return { baseUrl, authorization }
+}
+
 // ---- subscription / usage --------------------------------------------------
 
 /** Map a /v1/subscription response to magpie's usage shape. */
@@ -860,7 +1029,7 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
     tool_call: true,
   })
 
-  const modelOf = (provider, live) => {
+  const modelOf = (provider, live, accountChat = null) => {
     const base = provider.models?.[live.id] ?? {}
     const model = {
       ...base,
@@ -868,8 +1037,9 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
       name: live.name || base.name || live.id,
       limit: { context: num(live.contextLength) || base.limit?.context || 0, output: 0 },
     }
-    // Per-model chat base URL when the model carries one.
-    const chatConfig = resolveModelChatConfig(live)
+    // Chat base URL: the model's own when present, else the account-level
+    // model_info base resolved from the subscription check.
+    const chatConfig = resolveModelChatConfig(live) ?? accountChat
     if (chatConfig) model.api = chatConfig.baseUrl
     return model
   }
@@ -900,7 +1070,15 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
         try {
           const list = await fetchRemoteModels(cred, fetcher, env)
           if (!list.length) return provider.models
-          return Object.fromEntries(list.map((m) => [m.id, modelOf(provider, m)]))
+          // Chat credentials/base come from the subscription's model_info
+          // (per-model studio items rarely carry model_auth_info); when the
+          // account has no MaaS model_info, fall back to the desktop app's
+          // local routing state.
+          const accountChat = modelInfoChatConfig(await fetchModelInfo(cred, fetcher, env))
+            ?? await localChatConfig(null, env).catch(() => null)
+          return Object.fromEntries(
+            list.map((m) => [m.id, modelOf(provider, m, accountChat)]),
+          )
         } catch {
           return provider.models
         }
@@ -961,6 +1139,20 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
           return modelCache
         }
 
+        // Account-level MaaS chat config from the subscription check. This is
+        // the authoritative source of the chat base URL + Basic auth; the
+        // per-model studio list is only a fallback.
+        let accountChatCache
+        const accountChat = async () => {
+          if (accountChatCache !== undefined) return accountChatCache
+          try {
+            accountChatCache = modelInfoChatConfig(await fetchModelInfo(await current(), fetcher, env))
+          } catch {
+            accountChatCache = null
+          }
+          return accountChatCache
+        }
+
         const sessionId = randomHex(16)
         return {
           // Sentinel the SDK requires; the real credentials are applied by the
@@ -986,13 +1178,23 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
             const modelId = safeJson(bodyText)?.model
             const list = await modelsFor()
             const model = modelId ? list.find((m) => m.id === modelId) : undefined
+            // Prefer the model's own MaaS auth; then the account-level
+            // model_info from the subscription check; finally the desktop app's
+            // local routing state (modelgw base + Basic auth).
             const chatConfig = resolveModelChatConfig(model)
+              ?? await accountChat()
+              ?? await localChatConfig(modelId, env).catch(() => null)
 
             let targetUrl = url
             if (chatConfig) {
-              // Rewrite to the model's MaaS base + /chat/completions.
+              // Chat calls always go to the MaaS base + /chat/completions,
+              // whatever path the host derived from `baseURL`.
               const u = new URL(url)
-              if (u.pathname.endsWith("/chat/completions") || u.pathname.includes("/chat/")) {
+              const isChat = u.pathname.endsWith("/chat/completions")
+                || u.pathname.endsWith("/chat")
+                || u.pathname.includes("/chat/")
+                || /\/v\d*\/?$/.test(u.pathname)
+              if (isChat) {
                 targetUrl = `${chatConfig.baseUrl}/chat/completions`
               }
               headers.set("Authorization", chatConfig.authorization)
@@ -1121,5 +1323,7 @@ export const _internal = {
   toBytes, signedGet,
   parseModelInfo, fetchRemoteModels,
   buildMaasAuthorization, resolveModelChatConfig,
+  extractModelInfo, modelInfoChatConfig, fetchModelInfo,
+  localChatConfig, readLocalChatConfigs, localRoutingDirs,
   usageFromSubscription,
 }
