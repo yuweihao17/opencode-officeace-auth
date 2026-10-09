@@ -1,3 +1,4 @@
+// AI生成
 // OfficeAce (华为云果办 / OfficeClaw) as a magpie / OpenCode provider plugin.
 //
 // OfficeAce, Huawei Cloud's office-productivity agent (果办), serves its models
@@ -36,6 +37,14 @@
 
 const PROVIDER = "officeace"
 const NPM = "@ai-sdk/openai-compatible" // chat completions
+// `@ai-sdk/openai-compatible` refuses to build a request without a non-empty
+// apiKey: it calls loadApiKey() first and throws LoadAPIKeyError before our
+// `fetch` wrapper ever runs. OfficeAce auth is carried by that wrapper (MaaS
+// Basic auth, or SDK-HMAC-SHA256 signing of the temporary credential), so this
+// value is only a sentinel that lets the SDK dispatch. The desktop's own
+// huawei-maas.js sets the same kind of placeholder for the same reason
+// ("OpenAI-compatible SDKs still require an api_key field").
+const SESSION_API_KEY = "officeace-session"
 
 // ---- endpoints & flow constants --------------------------------------------
 //
@@ -874,6 +883,11 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
       p.name ??= "OfficeAce"
       p.npm ??= NPM
       p.api ??= `${clawBase(env)}/v2`
+      // Hosts that build the SDK straight from the provider's `options` (rather
+      // than from the auth loader below) still need the apiKey sentinel, or the
+      // SDK throws LoadAPIKeyError and every model reports "no response".
+      p.options ??= {}
+      p.options.apiKey ??= SESSION_API_KEY
       p.models = { ...Object.fromEntries(CATALOG.map((m) => [m.id, configModel(m)])), ...(p.models ?? {}) }
     },
 
@@ -949,6 +963,9 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
 
         const sessionId = randomHex(16)
         return {
+          // Sentinel the SDK requires; the real credentials are applied by the
+          // `fetch` wrapper below (MaaS Basic auth or SDK-HMAC-SHA256 signing).
+          apiKey: SESSION_API_KEY,
           baseURL: `${clawBase(env)}/v2`,
           async fetch(input, init = {}) {
             const c = await current()
@@ -962,8 +979,11 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
             else body = new Uint8Array()
 
             // Identify the model from the request body to resolve per-model
-            // chat base URL + MaaS Basic auth.
-            const modelId = typeof init?.body === "string" ? safeJson(init.body)?.model : undefined
+            // chat base URL + MaaS Basic auth. The body arrives as a string from
+            // ai-sdk, but as a Request when the host calls fetch(Request), so
+            // decode either form instead of only trusting `init.body`.
+            const bodyText = typeof init?.body === "string" ? init.body : new TextDecoder().decode(body)
+            const modelId = safeJson(bodyText)?.model
             const list = await modelsFor()
             const model = modelId ? list.find((m) => m.id === modelId) : undefined
             const chatConfig = resolveModelChatConfig(model)

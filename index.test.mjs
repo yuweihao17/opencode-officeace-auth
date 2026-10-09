@@ -1,3 +1,4 @@
+// AI生成
 // Unit tests for the OfficeAce OAuth plugin. Run with: node --test
 //
 // These tests exercise the pieces magpie calls (_internal helpers) and the
@@ -316,6 +317,8 @@ test("plugin exposes config, provider.models, and an oauth auth method", async (
   const p = config.provider.officeace
   assert.equal(p.npm, "@ai-sdk/openai-compatible")
   assert.ok(p.api)
+  // @ai-sdk/openai-compatible throws LoadAPIKeyError without a non-empty key.
+  assert.equal(p.options.apiKey, "officeace-session")
   assert.ok(p.models["glm-4.6"])
 })
 
@@ -348,6 +351,8 @@ test("loader authenticates a MaaS chat request with Basic auth and rewrites the 
   }
   const plugin = await OfficeAceAuthPlugin({ client: {} }, { fetch: fetcher })
   const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  // The SDK requires an apiKey field; the real auth is applied by the wrapper.
+  assert.equal(loaded.apiKey, "officeace-session")
 
   await loaded.fetch("https://agentarts.example.com/v2/chat/completions", {
     method: "POST",
@@ -390,6 +395,33 @@ test("loader signs a non-MaaS chat request with SDK-HMAC-SHA256", async () => {
   const chatCall = seen.find((s) => s.url.includes("/chat/completions"))
   const headers = new Headers(chatCall.init.headers)
   assert.match(headers.get("authorization"), /^SDK-HMAC-SHA256 Access=AK,/)
+})
+
+test("loader resolves the per-model MaaS auth when the body is a Request", async () => {
+  const cred = await makeCred()
+  const seen = []
+  const fetcher = async (url, init) => {
+    const u = String(url)
+    seen.push({ url: u, init })
+    if (u.includes("/v3.0/OS-CREDENTIAL/securitytokens")) return new Response("{}", { status: 404 })
+    if (u.includes("/v1/studio/model-services")) return new Response(modelServicesBody, { status: 200 })
+    if (u.includes("/chat/completions")) return new Response(JSON.stringify({ choices: [] }), { status: 200 })
+    return new Response("", { status: 404 })
+  }
+  const plugin = await OfficeAceAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+
+  // No `init.body`: the host handed us a Request, as fetch(Request) allows.
+  const request = new Request("https://agentarts.example.com/v2/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "glm-4.6", messages: [] }),
+  })
+  await loaded.fetch(request)
+
+  const chatCall = seen.find((s) => s.url.includes("/chat/completions"))
+  assert.equal(chatCall.url, "https://maas.example.com/v2/chat/completions")
+  assert.match(new Headers(chatCall.init.headers).get("authorization"), /^Basic /)
 })
 
 test("loader returns nothing when not signed in", async () => {
