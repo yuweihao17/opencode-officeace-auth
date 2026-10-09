@@ -262,6 +262,46 @@ test("usageFromSubscription surfaces a business error code", () => {
   assert.equal(usage.error, "boom")
 })
 
+test("usageFromSubscription reads the desktop's nested skus/quotas shape", () => {
+  const usage = x.usageFromSubscription({
+    subscribe_status: "SUBSCRIBED",
+    skus: [{ sku_name: "OfficeAce 标准版", quotas: [{ sku_attr_code: "officeace_points", sku_value: 500000, current_value: 121000 }] }],
+  })
+  assert.equal(usage.plan, "OfficeAce 标准版")
+  assert.equal(usage.signIn, "kept")
+  assert.deepEqual(usage.windows, [{
+    name: "积分", used: (121000 / 500000) * 100, display: "12.1万 / 50.0万", amount: 121000, limit: 500000, unit: "credits",
+  }])
+})
+
+test("usageFromSubscription separates bonus credits into their own window", () => {
+  const usage = x.usageFromSubscription({
+    skus: [{ quotas: [{ sku_attr_code: "officeace_points", sku_value: 1000, current_value: 100 }] }],
+    bonus_skus: [{ quotas: [{ sku_attr_code: "officeace_points", sku_value: 500, current_value: 0 }] }],
+  })
+  assert.deepEqual(usage.windows.map((w) => w.name), ["积分", "赠送积分"])
+  assert.equal(usage.windows[0].display, "100 / 1000")
+  assert.equal(usage.windows[1].display, "0 / 500")
+})
+
+test("usageFromSubscription honours the -1 unlimited marker", () => {
+  const usage = x.usageFromSubscription({ skus: [{ quotas: [{ sku_attr_code: "officeace_points", sku_value: -1 }] }] })
+  assert.deepEqual(usage.windows, [{ name: "积分", used: 0, display: "不限量", amount: 0, limit: 0, unit: "credits" }])
+})
+
+test("usageFromSubscription reports no credits for an unsubscribed account", () => {
+  const usage = x.usageFromSubscription({ domain_id: "d", subscribe_status: "UNSUBSCRIBED" })
+  assert.deepEqual(usage.windows, [])
+  assert.equal(usage.error, "该账号无积分额度")
+})
+
+test("subscriptionOrigin prefers the local model gateway and falls back to the claw base", async () => {
+  await withRoutingFixture(async (env) => {
+    assert.equal(await x.subscriptionOrigin(env), "https://modelgw-0004.officeace.cn-southwest-2.huaweicloud-agentarts.com")
+  })
+  assert.equal(await x.subscriptionOrigin({ OFFICEACE_ROUTING_DIR: join(tmpdir(), "officeace-missing") }), x.DEFAULT_CLAW_BASE)
+})
+
 // ---- remote model list -----------------------------------------------------
 
 const modelServicesBody = JSON.stringify({
@@ -556,7 +596,7 @@ test("auth.usage reports the plan's credit window", async () => {
     assert.ok(String(url).endsWith("/v1/subscription"))
     return new Response(JSON.stringify({ total_credits: 1000, used_credits: 400, plan_name: "企业版" }), { status: 200 })
   }
-  const plugin = await OfficeAceAuthPlugin({ client: {} }, { fetch: fetcher })
+  const plugin = await OfficeAceAuthPlugin({ client: {} }, { fetch: fetcher, env: NO_ROUTING_ENV })
   const usage = await plugin.auth.usage(async () => makeAuth(cred))
   assert.equal(usage.plan, "企业版")
   assert.deepEqual(usage.windows, [{ name: "积分", used: 40, display: "400 / 1000", amount: 400, limit: 1000, unit: "credits" }])

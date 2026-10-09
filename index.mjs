@@ -314,13 +314,16 @@ async function sdkAuthorization(method, url, headers, body, accessKey, secretKey
   return `${ALGO_SDK} Access=${accessKey}, SignedHeaders=${keys.join(";")}, Signature=${signature}`
 }
 
-/** V11-HMAC-SHA256 signing-key derivation: HMAC(HMAC(sk, date8), scope + 0x01)[:32]. */
-async function v11SigningKey(secretKey, date8, scope) {
-  const kDate = await hmacSha256Hex(utf8(secretKey), utf8(date8))
-  const buf = Buffer.concat([Buffer.from(scope, "utf8"), Buffer.from([1])])
-  // hmacSha256Hex returns hex; re-import as bytes for the second HMAC.
-  const kDateBytes = typed(Buffer.from(kDate, "hex"))
-  return await hmacSha256Hex(kDateBytes, buf)
+/**
+ * V11-HMAC-SHA256 signing key, byte-for-byte identical to the desktop app's z():
+ *   k = HMAC-SHA256(key = accessKey, data = secretKey)          // raw 32-byte digest
+ *   return hex( HMAC-SHA256(key = k, data = scope || 0x01) )     // 64-char HEX string
+ * Note: the result is a hex STRING and the desktop uses it verbatim as the key of the
+ * final HMAC — it must NOT be re-imported as bytes, or the signature will not match.
+ */
+async function v11SigningKey(accessKey, secretKey, scope) {
+  const k = typed(Buffer.from(await hmacSha256Hex(utf8(accessKey), utf8(secretKey)), "hex"))
+  return await hmacSha256Hex(k, new Uint8Array([...utf8(scope), 1]))
 }
 
 /** V11-HMAC-SHA256 Authorization header value. */
@@ -333,8 +336,9 @@ async function v11Authorization(method, url, headers, body, accessKey, secretKey
   const date = headers["x-sdk-date"]
   const scope = `${date.substring(0, 8)}/${regionId}/${V11_SERVICE}`
   const stringToSign = [ALGO_V11, date, scope, await sha256Hex(utf8(canonical))].join("\n")
-  const signingKey = await v11SigningKey(secretKey, date.substring(0, 8), scope)
-  const signature = await hmacSha256Hex(typed(Buffer.from(signingKey, "hex")), utf8(stringToSign))
+  const signingKey = await v11SigningKey(accessKey, secretKey, scope)
+  // The desktop uses the hex signing key as a STRING (utf8) here, not as raw bytes.
+  const signature = await hmacSha256Hex(utf8(signingKey), utf8(stringToSign))
   return `${ALGO_V11} Credential=${accessKey}/${scope}, SignedHeaders=${keys.join(";")}, Signature=${signature}`
 }
 
@@ -705,12 +709,12 @@ async function toBytes(body) {
 }
 
 /** A signed GET returning the response, or undefined on any failure. */
-async function signedGet(url, cred, fetcher, { extraHeaders, preferV3 = false, v3Credential, env } = {}) {
+async function signedGet(url, cred, fetcher, { extraHeaders, preferV3 = false, v3Credential, env, algorithm = ALGO_SDK, regionId = "" } = {}) {
   const v5 = { accessKey: cred.access_key_id, secretKey: cred.secret_access_key, securityToken: cred.security_token, projectId: cred.project_id || "" }
   try {
     const res = await fetchSigned({
       method: "GET", url, v5Credential: v5, v3Credential, fetchImpl: fetcher,
-      algorithm: ALGO_SDK, preferV3, iamSecurityTokenUrl: iamSecurityTokenUrl(env), env,
+      algorithm, regionId, preferV3, iamSecurityTokenUrl: iamSecurityTokenUrl(env), env,
       headers: extraHeaders,
     })
     if (!res.ok) return undefined
@@ -977,9 +981,28 @@ async function localChatConfig(modelId, env, now = Date.now()) {
   return { baseUrl, authorization }
 }
 
+/**
+ * Origin that serves the account's subscription/quota. The desktop resolves it from
+ * huawei_maas's baseUrl (the local model gateway) and falls back to the claw base —
+ * mirror that so the quota request lands on the same host the app itself would use.
+ */
+async function subscriptionOrigin(env) {
+  const local = await localChatConfig(null, env).catch(() => null)
+  if (local?.baseUrl) {
+    try { return new URL(local.baseUrl).origin } catch { /* fall through to claw base */ }
+  }
+  return clawBase(env)
+}
+
 // ---- subscription / usage --------------------------------------------------
 
-/** Map a /v1/subscription response to magpie's usage shape. */
+/**
+ * Map a /v1/subscription response to magpie's usage shape.
+ * Supports both the flat mock shape (total_credits/used_credits) and the desktop's
+ * real nested shape: skus[].quotas[] (entries whose sku_attr_code contains "points",
+ * e.g. "officeace_points"; sku_value = total, current_value = used, -1 = unlimited)
+ * plus bonus_skus[].
+ */
 function usageFromSubscription(raw) {
   const data = unwrapPayload(raw) ?? raw
   if (!asRecord(data)) return { error: "OfficeAce could not be parsed", windows: [] }
@@ -987,26 +1010,63 @@ function usageFromSubscription(raw) {
     return { error: firstOf(data.message, data.msg, `OfficeAce code ${data.code}`), windows: [] }
   }
 
-  const totalCredits = num(data.total_credits ?? data.totalCredits ?? data.total_credit)
-  const usedCredits = num(data.used_credits ?? data.usedCredits ?? data.used_credit)
-  const remainCredits = totalCredits > 0 ? Math.max(0, totalCredits - usedCredits) : num(data.remain_credits ?? data.remainCredits)
-  const plan = firstOf(data.plan_name, data.planName, data.tier, data.spec_code)
+  let plan = firstOf(data.plan_name, data.planName, data.tier, data.spec_code)
+  let unlimited = false
 
-  if (totalCredits <= 0 && usedCredits <= 0) return { plan: plan || undefined, windows: [], error: "该账号无积分额度" }
-
-  const used = clamp(totalCredits > 0 ? (usedCredits / totalCredits) * 100 : 0)
-  return {
-    plan: plan || undefined,
-    signIn: "kept",
-    windows: [{
-      name: "积分",
-      used,
-      display: `${formatCredit(usedCredits)} / ${formatCredit(totalCredits)}`,
-      amount: usedCredits,
-      limit: totalCredits,
-      unit: "credits",
-    }],
+  const listOf = (v) => (Array.isArray(v) ? v : [])
+  const pickNum = (...vs) => {
+    for (const v of vs) {
+      if (typeof v === "number" && Number.isFinite(v)) return v
+      if (typeof v === "string" && v.trim() && Number.isFinite(Number(v))) return Number(v)
+    }
+    return 0
   }
+  const sumSkus = (skus) => {
+    let total = 0
+    let used = 0
+    for (const sku of listOf(skus)) {
+      const rec = asRecord(sku)
+      if (!plan) plan = firstOf(rec.sku_name, rec.sku_name_cn, rec.name, rec.spec_code)
+      for (const q of listOf(rec.quotas)) {
+        const qrec = asRecord(q)
+        const code = firstOf(qrec.sku_attr_code, qrec.attr_code, qrec.code)
+        if (code && !/point|credit/i.test(code)) continue
+        const cap = pickNum(qrec.sku_value, qrec.total_value, qrec.total)
+        if (cap === -1) { unlimited = true; continue }
+        total += cap
+        used += pickNum(qrec.current_value, qrec.used_value, qrec.used)
+      }
+    }
+    return { total, used }
+  }
+
+  let totalCredits = num(data.total_credits ?? data.totalCredits ?? data.total_credit)
+  let usedCredits = num(data.used_credits ?? data.usedCredits ?? data.used_credit)
+  const main = sumSkus(data.skus)
+  totalCredits += main.total
+  usedCredits += main.used
+  const bonus = sumSkus(data.bonus_skus ?? data.bonusSkus)
+
+  const windows = []
+  const push = (name, used, total) => {
+    if (total <= 0 && used <= 0) return
+    windows.push({
+      name,
+      used: clamp(total > 0 ? (used / total) * 100 : 0),
+      display: `${formatCredit(used)} / ${formatCredit(total)}`,
+      amount: used,
+      limit: total,
+      unit: "credits",
+    })
+  }
+  push("积分", usedCredits, totalCredits)
+  push("赠送积分", bonus.used, bonus.total)
+  if (windows.length === 0 && unlimited) {
+    windows.push({ name: "积分", used: 0, display: "不限量", amount: 0, limit: 0, unit: "credits" })
+  }
+
+  if (windows.length === 0) return { plan: plan || undefined, windows: [], error: "该账号无积分额度" }
+  return { plan: plan || undefined, signIn: "kept", windows }
 }
 
 /** Compact credit counts for the display string (12345 → "1.2万"). */
@@ -1240,8 +1300,10 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
         const cred = credentialOf(auth)
         if (!cred?.access_key_id) return { error: "not signed in", windows: [] }
         try {
-          const res = await signedGet(subscriptionUrl(env), cred, fetcher, {
-            extraHeaders: { "x-subscription-type": "v2" }, env,
+          const base = await subscriptionOrigin(env)
+          const res = await signedGet(`${base}/v1/subscription`, cred, fetcher, {
+            extraHeaders: { "x-subscription-type": "v2" },
+            algorithm: ALGO_V11, regionId: REGION_ID, env,
           })
           if (!res) return { error: "OfficeAce answered an error", windows: [] }
           return usageFromSubscription(await res.json().catch(() => null))
@@ -1325,5 +1387,6 @@ export const _internal = {
   buildMaasAuthorization, resolveModelChatConfig,
   extractModelInfo, modelInfoChatConfig, fetchModelInfo,
   localChatConfig, readLocalChatConfigs, localRoutingDirs,
+  subscriptionOrigin,
   usageFromSubscription,
 }
