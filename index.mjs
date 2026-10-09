@@ -1065,7 +1065,18 @@ function usageFromSubscription(raw) {
     windows.push({ name: "积分", used: 0, display: "不限量", amount: 0, limit: 0, unit: "credits" })
   }
 
-  if (windows.length === 0) return { plan: plan || undefined, windows: [], error: "该账号无积分额度" }
+  if (windows.length === 0) {
+    // The account has no credit package (OfficeAce answers UNSUBSCRIBED with no
+    // skus). Report a definite, error-free state so magpie renders a value
+    // instead of falling back to its generic "allowance unavailable" text.
+    const status = firstOf(data.subscribe_status, data.subscribeStatus)
+    const label = /unsubscri/i.test(String(status)) ? "未订阅" : plan || "未订阅"
+    return {
+      plan: label,
+      signIn: "kept",
+      windows: [{ name: "积分", used: 0, display: "未订阅", amount: 0, limit: 0, unit: "credits" }],
+    }
+  }
   return { plan: plan || undefined, signIn: "kept", windows }
 }
 

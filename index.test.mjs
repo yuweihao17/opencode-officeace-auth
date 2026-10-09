@@ -251,10 +251,11 @@ test("usageFromSubscription maps credits to a single window", () => {
   }])
 })
 
-test("usageFromSubscription reports no credit plan when every bucket is empty", () => {
+test("usageFromSubscription reports a defined state when every bucket is empty", () => {
   const usage = x.usageFromSubscription({ total_credits: 0, used_credits: 0 })
-  assert.deepEqual(usage.windows, [])
-  assert.equal(usage.error, "该账号无积分额度")
+  assert.equal(usage.error, undefined)
+  assert.equal(usage.plan, "未订阅")
+  assert.deepEqual(usage.windows, [{ name: "积分", used: 0, display: "未订阅", amount: 0, limit: 0, unit: "credits" }])
 })
 
 test("usageFromSubscription surfaces a business error code", () => {
@@ -289,10 +290,11 @@ test("usageFromSubscription honours the -1 unlimited marker", () => {
   assert.deepEqual(usage.windows, [{ name: "积分", used: 0, display: "不限量", amount: 0, limit: 0, unit: "credits" }])
 })
 
-test("usageFromSubscription reports no credits for an unsubscribed account", () => {
+test("usageFromSubscription reports a defined state for an unsubscribed account", () => {
   const usage = x.usageFromSubscription({ domain_id: "d", subscribe_status: "UNSUBSCRIBED" })
-  assert.deepEqual(usage.windows, [])
-  assert.equal(usage.error, "该账号无积分额度")
+  assert.equal(usage.error, undefined)
+  assert.equal(usage.plan, "未订阅")
+  assert.deepEqual(usage.windows, [{ name: "积分", used: 0, display: "未订阅", amount: 0, limit: 0, unit: "credits" }])
 })
 
 test("subscriptionOrigin prefers the local model gateway and falls back to the claw base", async () => {
