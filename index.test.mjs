@@ -591,17 +591,9 @@ test("auth.refresh exchanges the refresh token for fresh credentials", async () 
   assert.equal(next.expires, Date.parse("2031-01-01T00:00:00Z"))
 })
 
-test("auth.usage reports the plan's credit window", async () => {
-  const cred = await makeCred()
-  const fetcher = async (url) => {
-    if (String(url).includes("/v3.0/OS-CREDENTIAL/securitytokens")) return new Response("{}", { status: 404 })
-    assert.ok(String(url).endsWith("/v1/subscription"))
-    return new Response(JSON.stringify({ total_credits: 1000, used_credits: 400, plan_name: "企业版" }), { status: 200 })
-  }
-  const plugin = await OfficeAceAuthPlugin({ client: {} }, { fetch: fetcher, env: NO_ROUTING_ENV })
-  const usage = await plugin.auth.usage(async () => makeAuth(cred))
-  assert.equal(usage.plan, "企业版")
-  assert.deepEqual(usage.windows, [{ name: "积分", used: 40, display: "400 / 1000", amount: 400, limit: 1000, unit: "credits" }])
+test("OfficeAce exposes no usage hook so magpie shows no credits card", async () => {
+  const plugin = await OfficeAceAuthPlugin({ client: {} }, { fetch: async () => new Response("{}", { status: 200 }), env: NO_ROUTING_ENV })
+  assert.equal(plugin.auth.usage, undefined)
 })
 
 // ---- OAuth state + code polling --------------------------------------------

@@ -1305,23 +1305,14 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
         }
       },
 
-      // magpie's own hook: how much of the plan is left.
-      async usage(getAuth) {
-        const auth = await getAuth()
-        const cred = credentialOf(auth)
-        if (!cred?.access_key_id) return { error: "not signed in", windows: [] }
-        try {
-          const base = await subscriptionOrigin(env)
-          const res = await signedGet(`${base}/v1/subscription`, cred, fetcher, {
-            extraHeaders: { "x-subscription-type": "v2" },
-            algorithm: ALGO_V11, regionId: REGION_ID, env,
-          })
-          if (!res) return { error: "OfficeAce answered an error", windows: [] }
-          return usageFromSubscription(await res.json().catch(() => null))
-        } catch (e) {
-          return { error: e?.message ?? String(e), windows: [] }
-        }
-      },
+      // NOTE: OfficeAce deliberately exposes **no** `usage` hook.
+      // Magpie renders a credits card only for providers whose auth defines
+      // `usage` (the host resolves it to null otherwise), and OfficeAce's
+      // /v1/subscription feed does not reflect this account's real usage — so
+      // we show no credits at all instead of a misleading number.
+      // The subscription helpers below (subscriptionOrigin /
+      // usageFromSubscription / the V11 signer) are kept unused for reference
+      // and for a possible future re-enable.
 
       methods: [
         {
