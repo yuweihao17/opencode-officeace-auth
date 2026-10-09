@@ -1,0 +1,12 @@
+{
+  "package": "opencode-officeace-auth",
+  "name": "OfficeAce",
+  "icon": "https://cdn.jsdelivr.net/npm/simple-icons@13/icons/huawei.svg",
+  "providers": ["officeace"],
+  "community": true,
+  "replaces": "officeace",
+  "summary": {
+    "en": "Huawei Cloud OfficeAce (果办) models — GLM, DeepSeek, openPangu and more — via Huawei Cloud OAuth sign-in (PKCE + DPoP) with V11 / SDK-HMAC-SHA256 signed requests and MaaS Basic-auth chat.",
+    "zh": "通过华为云 OAuth 授权登录接入果办模型：GLM、DeepSeek、盘古等（PKCE + DPoP，V11 / SDK-HMAC-SHA256 请求签名，MaaS Basic 鉴权聊天）。"
+  }
+}
